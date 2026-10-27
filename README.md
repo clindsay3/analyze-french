@@ -97,7 +97,7 @@ Each successful request is saved to `direct_output.jsonl` before the next reques
 
 Report token totals cover successfully saved responses. Failed responses and interrupted in-flight requests may incur additional charges; use your OpenAI usage dashboard for billing totals.
 
-Run only one process per output directory. An exclusive `.direct_run.lock` prevents concurrent direct execution. It is removed on normal exit and handled errors; after a crash or forced termination, remove that lock file only after confirming the previous process has stopped. A malformed or missing checkpoint must be restored or inspected before resuming; it is not silently discarded.
+Run only one state-changing command per output directory. An exclusive `.audit_run.lock` is shared by preparation, direct execution, Batch submission/collection, and report regeneration, preventing those operations from overlapping. It is removed on normal exit and handled errors; after a crash or forced termination, remove that lock file only after confirming the previous process has stopped. A malformed or missing checkpoint must be restored or inspected before resuming; it is not silently discarded.
 
 ## Model selection
 
@@ -144,7 +144,7 @@ Batch processing is asynchronous, with a `24h` completion window. `status` check
 
 Check `request_counts` for failed requests and inspect any `batch_errors.jsonl`. Unlike direct execution, the Batch collector does not enforce one unique result per prepared entry: compare `entry_count`, `collected_result_count`, and the sequence numbers before treating a Batch run as complete.
 
-Submit once per intended run: repeating `submit` creates another job and can incur additional charges. Use separate directories for direct and Batch execution; the script refuses to submit a direct run as a Batch job or run an already submitted Batch directory directly. See [API pricing](https://developers.openai.com/api/docs/pricing) for the processing-tier price difference.
+Submit once per intended run: repeating `submit` creates another job and can incur additional charges. Use separate directories for direct and Batch execution; the script refuses Batch submission/collection in a direct directory or direct execution in an already submitted Batch directory. See [API pricing](https://developers.openai.com/api/docs/pricing) for the processing-tier price difference.
 
 ## Output files
 

@@ -49,6 +49,15 @@ class FakeResponses:
         return SimpleNamespace(model_dump=lambda: response)
 
 
+def batch_client(calls, upload=None):
+    return SimpleNamespace(
+        files=SimpleNamespace(create=upload or (lambda **kwargs: (
+            calls.append("files.create") or SimpleNamespace(id="file_created")))),
+        batches=SimpleNamespace(create=lambda **kwargs: (
+            calls.append("batches.create") or SimpleNamespace(id="batch_created", status="validating"))),
+    )
+
+
 class DirectRunTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -94,7 +103,7 @@ class DirectRunTests(unittest.TestCase):
         self.assertEqual(manifest["collected_result_count"], 3)
         self.assertEqual(manifest["usage"], {"input_tokens": 20, "output_tokens": 10, "total_tokens": 30})
         self.assertNotIn("batch_id", manifest)
-        self.assertFalse((self.output / ".direct_run.lock").exists())
+        self.assertFalse((self.output / ".audit_run.lock").exists())
 
     def test_resume_skips_paid_successes_after_request_failure(self):
         def fail_second(body):
@@ -153,7 +162,7 @@ class DirectRunTests(unittest.TestCase):
                 self.assertEqual(self.manifest()["collected_result_count"], 0)
                 failure = json.loads((self.output / "direct_failure.json").read_text())
                 self.assertIsNotNone(failure["response"])
-                self.assertFalse((self.output / ".direct_run.lock").exists())
+                self.assertFalse((self.output / ".audit_run.lock").exists())
         self.run_direct(None, "--resume")
         self.assertEqual(self.manifest()["direct_status"], "completed")
 
@@ -191,12 +200,12 @@ class DirectRunTests(unittest.TestCase):
             factory.assert_not_called()
 
     def test_existing_lock_prevents_concurrent_paid_execution(self):
-        (self.output / ".direct_run.lock").write_text("123\n")
+        (self.output / ".audit_run.lock").write_text("123\n")
         with patch.object(audit, "get_openai_client") as factory:
             with self.assertRaises(SystemExit):
                 audit.main(["run", "--output-dir", str(self.output)])
             factory.assert_not_called()
-        self.assertTrue((self.output / ".direct_run.lock").exists())
+        self.assertTrue((self.output / ".audit_run.lock").exists())
 
     def test_existing_report_is_not_overwritten_by_a_fresh_direct_run(self):
         report = self.output / "suspect_entries.csv"
@@ -216,6 +225,93 @@ class DirectRunTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 audit.main(["submit", "--output-dir", str(self.output)])
             factory.assert_not_called()
+
+    def test_batch_submission_is_excluded_during_direct_client_creation(self):
+        calls = []
+        direct = SimpleNamespace(responses=FakeResponses())
+        batch = batch_client(calls)
+
+        def factory(args):
+            if args.command == "run":
+                with self.assertRaises(SystemExit):
+                    audit.main(["submit", "--output-dir", str(self.output)])
+                return direct
+            return batch
+
+        with patch.object(audit, "get_openai_client", side_effect=factory):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(audit.main(["run", "--output-dir", str(self.output)]), 0)
+        self.assertEqual(calls, [])
+        self.assertEqual(len(direct.responses.calls), 2)
+        self.assertEqual(self.manifest()["execution_mode"], "direct")
+        self.assertNotIn("batch_id", self.manifest())
+
+    def test_direct_execution_is_excluded_during_batch_upload(self):
+        calls = []
+        direct = SimpleNamespace(responses=FakeResponses())
+
+        def upload(**kwargs):
+            calls.append("files.create")
+            with self.assertRaises(SystemExit):
+                audit.main(["run", "--output-dir", str(self.output)])
+            return SimpleNamespace(id="file_created")
+
+        batch = batch_client(calls, upload)
+        with patch.object(audit, "get_openai_client", side_effect=lambda args: direct if args.command == "run" else batch):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(audit.main(["submit", "--output-dir", str(self.output)]), 0)
+        self.assertEqual(calls, ["files.create", "batches.create"])
+        self.assertEqual(direct.responses.calls, [])
+        self.assertEqual(self.manifest()["batch_id"], "batch_created")
+        self.assertFalse((self.output / "direct_output.jsonl").exists())
+
+    def test_batch_collection_cannot_replace_direct_reports(self):
+        self.run_direct()
+        for remove_mode in (False, True):
+            if remove_mode:
+                manifest = self.manifest()
+                manifest.pop("execution_mode")
+                audit.save_manifest(self.output, manifest)
+            before = {p.name: p.read_bytes() for p in self.output.iterdir()}
+            with patch.object(audit, "get_openai_client") as factory:
+                with self.assertRaises(SystemExit):
+                    audit.main(["collect", "--output-dir", str(self.output), "--batch-id", "batch_external"])
+                factory.assert_not_called()
+            self.assertEqual(before, {p.name: p.read_bytes() for p in self.output.iterdir()})
+
+    def test_all_directory_writers_share_the_operation_lock(self):
+        (self.output / "analysis_results.jsonl").write_text("")
+        (self.output / ".audit_run.lock").write_text("123\n")
+        before = {p.name: p.read_bytes() for p in self.output.iterdir()}
+        commands = [
+            ["prepare", "--xml-path", str(self.xml)],
+            ["submit"], ["collect", "--batch-id", "batch_external"], ["summarize"],
+        ]
+        for command in commands:
+            with self.subTest(command=command[0]):
+                with patch.object(audit, "get_openai_client") as factory:
+                    with self.assertRaises(SystemExit):
+                        audit.main([*command, "--output-dir", str(self.output)])
+                    factory.assert_not_called()
+                self.assertEqual(before, {p.name: p.read_bytes() for p in self.output.iterdir()})
+
+    def test_legacy_batch_collection_still_writes_reports(self):
+        manifest = self.manifest()
+        manifest["batch_id"] = "batch_existing"
+        audit.save_manifest(self.output, manifest)
+        requests = [json.loads(line) for line in Path(manifest["requests_path"]).read_text().splitlines()]
+        raw = '\n'.join(json.dumps({"custom_id": r["custom_id"], "response": {
+            "status_code": 200, "body": response_for(r["body"])
+        }}) for r in requests)
+        client = SimpleNamespace(
+            batches=SimpleNamespace(retrieve=lambda batch_id: {"status": "completed", "output_file_id": "file_result"}),
+            files=SimpleNamespace(content=lambda file_id: raw.encode()),
+        )
+        with patch.object(audit, "get_openai_client", return_value=client):
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(audit.main(["collect", "--output-dir", str(self.output)]), 0)
+        self.assertEqual(self.manifest()["collected_result_count"], 3)
+        self.assertFalse((self.output / ".audit_run.lock").exists())
 
     def test_failure_message_redacts_the_configured_key(self):
         secret = "test-private-value"

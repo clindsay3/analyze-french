@@ -23,6 +23,7 @@ import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -413,6 +414,20 @@ def parse_ent_seq_filter(raw: str | None) -> set[int] | None:
     return out
 
 
+@contextmanager
+def output_directory_lock(output_dir: Path):
+    lock_path = output_dir / ".audit_run.lock"
+    try:
+        with lock_path.open("x", encoding="utf-8") as lock:
+            lock.write(f"{os.getpid()}\n")
+    except FileExistsError as exc:
+        raise SystemExit("Another command may be using this directory. If it crashed, confirm it stopped before removing .audit_run.lock.") from exc
+    try:
+        yield
+    finally:
+        lock_path.unlink(missing_ok=True)
+
+
 def prepare(args: argparse.Namespace) -> int:
     xml_path = Path(args.xml_path)
     if not xml_path.exists():
@@ -420,6 +435,11 @@ def prepare(args: argparse.Namespace) -> int:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    with output_directory_lock(output_dir):
+        return prepare_requests(args, xml_path, output_dir)
+
+
+def prepare_requests(args: argparse.Namespace, xml_path: Path, output_dir: Path) -> int:
     context_path = output_dir / "entry_context.jsonl"
     requests_path = output_dir / "batch_requests.jsonl"
     manifest_path = output_dir / "manifest.json"
@@ -477,7 +497,7 @@ def prepare(args: argparse.Namespace) -> int:
     metadata_candidate = xml_path.parent / "JMdict.download-metadata.json"
     if metadata_candidate.exists():
         manifest["download_metadata"] = json.loads(metadata_candidate.read_text(encoding="utf-8"))
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    save_manifest(output_dir, manifest)
 
     print(f"Wrote {context_path}")
     print(f"Wrote {requests_path}")
@@ -503,13 +523,23 @@ def save_manifest(output_dir: Path, manifest: dict[str, Any]) -> None:
     temporary_path.replace(output_dir / "manifest.json")
 
 
-def submit(args: argparse.Namespace) -> int:
-    output_dir = Path(args.output_dir)
-    manifest = load_manifest(output_dir)
+def require_batch_directory(output_dir: Path, manifest: dict[str, Any]) -> None:
     if manifest.get("execution_mode") == "direct" or any(
         (output_dir / name).exists() for name in ("direct_output.jsonl", "direct_failure.json")
     ):
         raise SystemExit("This is a direct API run. Prepare a new directory for a Batch job.")
+
+
+def submit(args: argparse.Namespace) -> int:
+    output_dir = Path(args.output_dir)
+    load_manifest(output_dir)
+    with output_directory_lock(output_dir):
+        return submit_prepared(args, output_dir)
+
+
+def submit_prepared(args: argparse.Namespace, output_dir: Path) -> int:
+    manifest = load_manifest(output_dir)
+    require_batch_directory(output_dir, manifest)
     requests_path = Path(manifest["requests_path"])
     if not requests_path.exists():
         raise SystemExit(f"Batch request file not found: {requests_path}")
@@ -817,16 +847,8 @@ def run_direct(args: argparse.Namespace, output_dir: Path) -> int:
 def run(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
     load_manifest(output_dir)
-    lock_path = output_dir / ".direct_run.lock"
-    try:
-        with lock_path.open("x", encoding="utf-8") as lock:
-            lock.write(f"{os.getpid()}\n")
-    except FileExistsError as exc:
-        raise SystemExit("Another direct run may be active. If it crashed, confirm it stopped before removing .direct_run.lock.") from exc
-    try:
+    with output_directory_lock(output_dir):
         return run_direct(args, output_dir)
-    finally:
-        lock_path.unlink(missing_ok=True)
 
 
 def should_write_suspect(row: dict[str, Any], include_needs_review: bool) -> bool:
@@ -960,7 +982,14 @@ def write_artifacts(
 
 def collect(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
+    load_manifest(output_dir)
+    with output_directory_lock(output_dir):
+        return collect_batch(args, output_dir)
+
+
+def collect_batch(args: argparse.Namespace, output_dir: Path) -> int:
     manifest = load_manifest(output_dir)
+    require_batch_directory(output_dir, manifest)
     client = get_openai_client(args)
     batch_id = batch_id_from_args(args, manifest)
     batch = client.batches.retrieve(batch_id)
@@ -998,6 +1027,13 @@ def collect(args: argparse.Namespace) -> int:
 
 def summarize(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
+    if not (output_dir / "analysis_results.jsonl").exists():
+        raise SystemExit(f"Results file not found: {output_dir / 'analysis_results.jsonl'}")
+    with output_directory_lock(output_dir):
+        return summarize_results(args, output_dir)
+
+
+def summarize_results(args: argparse.Namespace, output_dir: Path) -> int:
     results_path = output_dir / "analysis_results.jsonl"
     if not results_path.exists():
         raise SystemExit(f"Results file not found: {results_path}")
