@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """Audit JMdict French glosses against Japanese forms and English glosses.
 
-The workflow is designed for large, reproducible OpenAI Batch API runs:
+The workflow supports direct Responses API calls and optional Batch API runs:
 
 1. download-jmdict: fetch the current official JMdict.gz and decompress it.
-2. prepare: parse entries with French glosses and create Batch request JSONL.
-3. submit/status/collect: run and collect an OpenAI Batch job.
-4. summarize: regenerate CSV and Markdown summaries from collected JSONL.
+2. prepare: parse entries with French glosses and create request JSONL.
+3. run: audit prepared entries directly, with saved progress and --resume.
+4. submit/status/collect: alternatively run and collect an OpenAI Batch job.
+5. summarize: regenerate CSV and Markdown summaries from collected JSONL.
 """
 
 from __future__ import annotations
@@ -482,7 +483,7 @@ def prepare(args: argparse.Namespace) -> int:
     print(f"Wrote {requests_path}")
     print(f"Wrote {manifest_path}")
     print(f"Entries: {len(entries)}")
-    print(f"Batch requests: {request_count}")
+    print(f"API requests: {request_count}")
     return 0
 
 
@@ -494,15 +495,21 @@ def load_manifest(output_dir: Path) -> dict[str, Any]:
 
 
 def save_manifest(output_dir: Path, manifest: dict[str, Any]) -> None:
-    (output_dir / "manifest.json").write_text(
+    temporary_path = output_dir / ".manifest.json.tmp"
+    temporary_path.write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    temporary_path.replace(output_dir / "manifest.json")
 
 
 def submit(args: argparse.Namespace) -> int:
     output_dir = Path(args.output_dir)
     manifest = load_manifest(output_dir)
+    if manifest.get("execution_mode") == "direct" or any(
+        (output_dir / name).exists() for name in ("direct_output.jsonl", "direct_failure.json")
+    ):
+        raise SystemExit("This is a direct API run. Prepare a new directory for a Batch job.")
     requests_path = Path(manifest["requests_path"])
     if not requests_path.exists():
         raise SystemExit(f"Batch request file not found: {requests_path}")
@@ -651,6 +658,175 @@ def parse_batch_output(raw_output_path: Path, context_by_seq: dict[int, dict[str
         usage["non_200_responses"] = errors
     rows.sort(key=lambda r: r["ent_seq"])
     return rows, usage
+
+
+def direct_request_sequences(request: dict[str, Any]) -> list[int]:
+    if request.get("method") != "POST" or request.get("url") != "/v1/responses":
+        raise ValueError("Prepared requests must target POST /v1/responses.")
+    prompts = [
+        content["text"]
+        for item in request["body"]["input"]
+        if item.get("role") == "user"
+        for content in item.get("content", [])
+        if content.get("type") == "input_text"
+    ]
+    if len(prompts) != 1:
+        raise ValueError("Expected one prepared entry prompt per request.")
+    entries = json.loads(prompts[0])["entries"]
+    sequences = [entry["ent_seq"] for entry in entries]
+    if not sequences or any(type(seq) is not int for seq in sequences):
+        raise ValueError("Prepared entries must have integer sequence numbers.")
+    if len(set(sequences)) != len(sequences):
+        raise ValueError("Prepared request contains duplicate entries.")
+    return sequences
+
+
+def validate_direct_response(body: dict[str, Any], expected: list[int]) -> None:
+    if body.get("status") != "completed" or body.get("error"):
+        raise ValueError(f"Response did not complete: {body.get('status')}; {body.get('incomplete_details')}")
+    text = extract_output_text(body)
+    if not text:
+        raise ValueError("Response has no audit output (it may contain a refusal).")
+    results = json.loads(text).get("results")
+    if not isinstance(results, list):
+        raise ValueError("Response has no results list.")
+    required = set(RESPONSE_SCHEMA["properties"]["results"]["items"]["required"])
+    if any(not isinstance(row, dict) or not required.issubset(row) for row in results):
+        raise ValueError("Response contains incomplete result objects.")
+    sequences = [row["ent_seq"] for row in results]
+    if any(type(seq) is not int for seq in sequences):
+        raise ValueError("Response sequence numbers must be integers.")
+    if len(sequences) != len(expected) or set(sequences) != set(expected):
+        raise ValueError("Response contains missing, duplicate, or unexpected entries.")
+
+
+def run_direct(args: argparse.Namespace, output_dir: Path) -> int:
+    manifest = load_manifest(output_dir)
+    if manifest.get("batch_id"):
+        raise SystemExit("This directory already has a Batch job. Prepare a new directory for direct execution.")
+    requests_path = Path(manifest["requests_path"])
+    context_path = Path(manifest["context_path"])
+    raw_path = output_dir / "direct_output.jsonl"
+    fingerprints = {
+        "direct_requests_sha256": sha256_file(requests_path),
+        "direct_context_sha256": sha256_file(context_path),
+    }
+    if args.resume:
+        if manifest.get("execution_mode") != "direct" or any(
+            manifest.get(key) != value for key, value in fingerprints.items()
+        ):
+            raise SystemExit("Cannot resume: this is not the same prepared direct run.")
+    elif manifest.get("execution_mode") or raw_path.exists() or any(
+        (output_dir / name).exists() for name in (
+            "analysis_results.jsonl", "suspect_entries.csv", "summary.md", "likely_error_missing_core_meaning.txt"
+        )
+    ):
+        raise SystemExit("Run output already exists. Use run --resume or prepare a new directory.")
+
+    requests = [json.loads(line) for line in requests_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    context = load_context(context_path)
+    expected_by_request: dict[str, list[int]] = {}
+    for request in requests:
+        custom_id = request.get("custom_id")
+        if not isinstance(custom_id, str) or not custom_id or custom_id in expected_by_request:
+            raise ValueError("Prepared requests need unique custom IDs.")
+        if request["body"].get("model") != manifest["model"]:
+            raise ValueError("Prepared request model differs from the manifest.")
+        expected_by_request[custom_id] = direct_request_sequences(request)
+    all_sequences = [seq for sequences in expected_by_request.values() for seq in sequences]
+    if (len(requests) != manifest["request_count"] or not requests
+            or len(all_sequences) != manifest["entry_count"]
+            or len(context) != manifest["entry_count"]
+            or len(set(all_sequences)) != len(all_sequences) or set(all_sequences) != set(context)):
+        raise ValueError("Prepared requests, context, and manifest disagree about the audit entries.")
+
+    completed: set[str] = set()
+    if raw_path.exists():
+        for line in raw_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            custom_id = record.get("custom_id")
+            if custom_id not in expected_by_request or custom_id in completed:
+                raise ValueError("Direct checkpoint has an unknown or duplicate request.")
+            response = record["response"]
+            if response.get("status_code") != 200:
+                raise ValueError("Direct checkpoint contains an unsuccessful request.")
+            validate_direct_response(response["body"], expected_by_request[custom_id])
+            completed.add(custom_id)
+    if len(completed) < manifest.get("direct_completed_requests", 0):
+        raise ValueError("Saved direct responses are missing. Restore the checkpoint before resuming.")
+
+    pending = [request for request in requests if request["custom_id"] not in completed]
+    client = get_openai_client(args) if pending else None
+    manifest.update(fingerprints)
+    manifest.update(execution_mode="direct", direct_status="running")
+    manifest.setdefault("direct_started_at_utc", utc_now())
+    manifest.pop("direct_error", None)
+    save_manifest(output_dir, manifest)
+
+    def save_reports(status: str) -> None:
+        rows, usage = parse_batch_output(raw_path, context) if raw_path.exists() else ([], Counter())
+        write_artifacts(rows, output_dir, include_needs_review=args.include_needs_review, usage=usage)
+        manifest.update(direct_status=status, direct_completed_requests=len(completed),
+                        collected_result_count=len(rows), usage=dict(usage))
+        if status == "completed":
+            manifest["collected_at_utc"] = utc_now()
+        save_manifest(output_dir, manifest)
+
+    current_id: str | None = None
+    body: dict[str, Any] | None = None
+    try:
+        for request in pending:
+            current_id = request["custom_id"]
+            body = None
+            expected = expected_by_request[current_id]
+            print(f"Request {len(completed) + 1}/{len(requests)}: auditing {len(expected)} entries...", flush=True)
+            if client is None:
+                raise RuntimeError("No API client is available for pending requests.")
+            response = client.responses.create(**request["body"])
+            body = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+            validate_direct_response(body, expected)
+            record = {"custom_id": current_id, "response": {"status_code": 200, "body": body}}
+            with raw_path.open("a", encoding="utf-8") as checkpoint:
+                checkpoint.write(json.dumps(record, ensure_ascii=False) + "\n")
+                checkpoint.flush()
+                os.fsync(checkpoint.fileno())
+            completed.add(current_id)
+            manifest["direct_completed_requests"] = len(completed)
+            save_manifest(output_dir, manifest)
+            print(f"Saved {len(completed)}/{len(requests)} requests.", flush=True)
+        save_reports("completed")
+    except (Exception, KeyboardInterrupt) as exc:
+        message = str(exc) or type(exc).__name__
+        key = os.environ.get("OPENAI_API_KEY")
+        if key:
+            message = message.replace(key, "[REDACTED]")
+        manifest["direct_error"] = message
+        failure = {"custom_id": current_id, "error": message, "response": body}
+        (output_dir / "direct_failure.json").write_text(
+            json.dumps(failure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        save_reports("interrupted" if isinstance(exc, KeyboardInterrupt) else "failed")
+        if isinstance(exc, KeyboardInterrupt):
+            raise SystemExit(130) from exc
+        raise SystemExit(f"Direct run failed: {message}. Saved results are intact; use run --resume.") from exc
+    print(f"Direct audit completed: {manifest['collected_result_count']} entries.")
+    return 0
+
+
+def run(args: argparse.Namespace) -> int:
+    output_dir = Path(args.output_dir)
+    load_manifest(output_dir)
+    lock_path = output_dir / ".direct_run.lock"
+    try:
+        with lock_path.open("x", encoding="utf-8") as lock:
+            lock.write(f"{os.getpid()}\n")
+    except FileExistsError as exc:
+        raise SystemExit("Another direct run may be active. If it crashed, confirm it stopped before removing .direct_run.lock.") from exc
+    try:
+        return run_direct(args, output_dir)
+    finally:
+        lock_path.unlink(missing_ok=True)
 
 
 def should_write_suspect(row: dict[str, Any], include_needs_review: bool) -> bool:
@@ -847,7 +1023,7 @@ def build_parser() -> argparse.ArgumentParser:
     dl.add_argument("--timeout-seconds", type=int, default=120)
     dl.set_defaults(func=download_jmdict)
 
-    prep = sub.add_parser("prepare", help="Create Batch request JSONL from JMdict XML")
+    prep = sub.add_parser("prepare", help="Prepare API requests from JMdict XML")
     prep.add_argument("--xml-path", default="data/JMdict.xml")
     prep.add_argument("--output-dir", default="analysis_output_latest")
     prep.add_argument("--model", default="gpt-6-luna")
@@ -859,6 +1035,14 @@ def build_parser() -> argparse.ArgumentParser:
     prep.add_argument("--max-entries", type=int)
     prep.add_argument("--ent-seq", help="Comma-separated sequence numbers for a targeted run")
     prep.set_defaults(func=prepare)
+
+    direct = sub.add_parser("run", help="Audit prepared entries directly through the Responses API")
+    direct.add_argument("--output-dir", default="analysis_output_latest")
+    direct.add_argument("--env-file", default=".env")
+    direct.add_argument("--api-key-file", default="~/openai-translation-key.txt")
+    direct.add_argument("--resume", action="store_true", help="Continue the same run, skipping saved successful requests")
+    direct.add_argument("--include-needs-review", action="store_true")
+    direct.set_defaults(func=run)
 
     for name, help_text in [
         ("submit", "Upload request file and create an OpenAI Batch job"),
