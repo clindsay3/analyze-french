@@ -136,6 +136,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.*
 .envrc
 .venv
 env/
@@ -193,6 +194,12 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Local JMdict audit data and OpenAI Batch outputs
+data/
+data_*/
+analysis_output*/
+recovered_analysis_output/
 
 # Cursor
 #  Cursor is an AI-powered code editor. `.cursorignore` specifies files/directories to
