@@ -52,7 +52,7 @@ This downloads the official multilingual `JMdict.gz`, decompresses it to `data/J
   --max-entries 3
 ```
 
-`prepare` creates the request file, entry context, and manifest locally. It does not contact OpenAI or incur API charges. The default model is `gpt-5-mini`; use `--model MODEL` during preparation to select another model compatible with Batch, the Responses API, and structured outputs.
+`prepare` creates the request file, entry context, and manifest locally. It does not contact OpenAI or incur API charges. The default model is `gpt-6-luna`; see [Model selection](#model-selection) for alternatives.
 
 To select particular JMdict sequence numbers instead, replace `--max-entries 3` with `--ent-seq 1372800,1424150,1597040`.
 
@@ -101,6 +101,31 @@ Once `status` reports `completed`, collect the results:
 ```
 
 Use a different `analysis_output_*` directory for each new run. Re-running `prepare` in an existing directory overwrites its manifest and prepared files, including the saved batch ID. Full runs can process thousands of entries; cost depends on the model, dictionary snapshot, and generated output.
+
+## Model selection
+
+The default is **`gpt-6-luna`**, OpenAI's current model for focused, high-volume workloads. These API model IDs support Batch, the Responses API, and structured outputs according to their documentation (checked October 27, 2026):
+
+| Model | Intended role |
+| --- | --- |
+| [`gpt-6-luna`](https://developers.openai.com/api/docs/models/gpt-6-luna) | Default for an economical full audit. |
+| [`gpt-6.1-terra`](https://developers.openai.com/api/docs/models/gpt-6.1-terra) | Alternative for drafting and revising text. |
+| [`gpt-6.1-sol`](https://developers.openai.com/api/docs/models/gpt-6.1-sol) | Alternative for more complex reasoning and difficult entries. |
+
+These roles follow the model documentation; they are not a measured ranking of French dictionary accuracy. Check model access and current pricing for your API project, and review a small audit before selecting a model for a full run. `gpt-5-mini` remains available in the [API catalog](https://developers.openai.com/api/docs/models/gpt-5-mini), but is no longer this script's default. API availability can differ from ChatGPT and Codex model menus.
+
+Select the model when preparing a new run. For example, to audit three entries with Sol:
+
+```bash
+.venv/bin/python jmdict_french_audit.py prepare \
+  --xml-path data/JMdict.xml \
+  --output-dir analysis_output_sol_smoke \
+  --max-entries 3 \
+  --model gpt-6.1-sol \
+  --reasoning-effort medium
+```
+
+The script leaves reasoning effort to the API unless `--reasoning-effort` is supplied. Luna, Terra, and Sol currently default to `medium`; supported effort values depend on the model. Use the same output directory for subsequent `submit`, `status`, and `collect` commands. Prepared request files retain their selected model: updating the script does not change an existing run or a previously submitted batch.
 
 ## Output files
 

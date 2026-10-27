@@ -850,7 +850,7 @@ def build_parser() -> argparse.ArgumentParser:
     prep = sub.add_parser("prepare", help="Create Batch request JSONL from JMdict XML")
     prep.add_argument("--xml-path", default="data/JMdict.xml")
     prep.add_argument("--output-dir", default="analysis_output_latest")
-    prep.add_argument("--model", default="gpt-5-mini")
+    prep.add_argument("--model", default="gpt-6-luna")
     prep.add_argument("--entries-per-request", type=int, default=20)
     prep.add_argument("--max-senses-per-entry", type=int, default=40)
     prep.add_argument("--max-glosses-per-sense", type=int, default=12)
