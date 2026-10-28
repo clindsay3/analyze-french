@@ -542,6 +542,18 @@ def prepare_requests(args: argparse.Namespace, xml_path: Path, output_dir: Path)
     context_path = output_dir / "entry_context.jsonl"
     requests_path = output_dir / "batch_requests.jsonl"
     manifest_path = output_dir / "manifest.json"
+    previous = load_manifest(output_dir) if manifest_path.exists() else {}
+    saved_outputs = (
+        "analysis_results.jsonl", "direct_output.jsonl", "batch_output.jsonl", "suspect_entries.csv",
+        "summary.md", "likely_error_missing_core_meaning.txt", "direct_failure.json", "batch_errors.jsonl",
+    )
+    if previous.get("execution_mode") or previous.get("batch_id") or any(
+        (output_dir / name).exists() for name in saved_outputs
+    ):
+        raise SystemExit(
+            "This directory contains audit execution state or saved results. Prepare a new directory; "
+            "use run --resume or summarize to continue this run."
+        )
 
     entries = list(
         iter_french_entries(

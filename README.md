@@ -95,7 +95,7 @@ After checking the sample, prepare all entries with French glosses in a new outp
 .venv/bin/python jmdict_french_audit.py run --output-dir analysis_output_full
 ```
 
-Use a different `analysis_output_*` directory for each new run. Re-running `prepare` in an existing directory overwrites its manifest and prepared files; it is not how you resume a direct audit. Full runs can process thousands of entries; cost depends on the model, dictionary snapshot, and generated output.
+Use a different `analysis_output_*` directory for each new run. `prepare` refuses to overwrite a directory with execution state, a submitted Batch job, or saved results, so old findings cannot acquire replacement provenance. It can replace an unused prepared request set; it is not how you resume a direct audit. Full runs can process thousands of entries; cost depends on the model, dictionary snapshot, and generated output.
 
 ## Resume a direct run
 

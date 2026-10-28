@@ -443,6 +443,26 @@ class DirectRunTests(unittest.TestCase):
                 audit.main(["prepare", "--xml-path", str(self.xml), "--output-dir", str(self.output)])
             self.assertEqual(self.manifest()["dictionary_snapshot_date"], "2026-05-29" if matches else "")
 
+    def test_reprepare_cannot_relabel_saved_findings_with_new_provenance(self):
+        self.run_direct()
+        before = {path.name: path.read_bytes() for path in self.output.iterdir()}
+        with self.assertRaisesRegex(SystemExit, "Prepare a new directory"):
+            audit.main(["prepare", "--xml-path", str(self.xml), "--output-dir", str(self.output),
+                        "--model", "different-model", "--snapshot-date", "2026-10-28"])
+        self.assertEqual(before, {path.name: path.read_bytes() for path in self.output.iterdir()})
+        with contextlib.redirect_stdout(io.StringIO()):
+            audit.main(["summarize", "--output-dir", str(self.output)])
+        self.assertEqual(before["suspect_entries.csv"], (self.output / "suspect_entries.csv").read_bytes())
+
+    def test_prepare_preserves_submitted_state_before_results_exist(self):
+        manifest = self.manifest()
+        manifest["batch_id"] = "batch_in_progress"
+        audit.save_manifest(self.output, manifest)
+        before = {path.name: path.read_bytes() for path in self.output.iterdir()}
+        with self.assertRaisesRegex(SystemExit, "Prepare a new directory"):
+            audit.main(["prepare", "--xml-path", str(self.xml), "--output-dir", str(self.output)])
+        self.assertEqual(before, {path.name: path.read_bytes() for path in self.output.iterdir()})
+
 
 class AuditInputTests(unittest.TestCase):
     def setUp(self):
