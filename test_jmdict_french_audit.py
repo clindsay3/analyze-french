@@ -1,4 +1,5 @@
 import contextlib
+import copy
 import csv
 import io
 import json
@@ -8,6 +9,7 @@ from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 import jmdict_french_audit as audit
 
@@ -23,6 +25,12 @@ def result_for(sequence):
         "core_meanings_french": [],
         "suggested_french_senses": [],
         "suggested_action": "keep_existing" if status == "ok" else "manual_review",
+        "missing_meaning_evidence": [] if status == "ok" else [{
+            "japanese_meaning": "The ordinary meaning of the word",
+            "why_core": "Used in everyday descriptions of the action",
+            "closest_existing_french": "The supplied French describes only a secondary use",
+            "coverage_gap": "That gloss does not express the ordinary action",
+        }],
     }
 
 
@@ -325,6 +333,153 @@ class DirectRunTests(unittest.TestCase):
         self.assertNotIn(secret, str(error.exception))
         self.assertNotIn(secret, (self.output / "direct_failure.json").read_text())
         self.assertNotIn(secret, (self.output / "manifest.json").read_text())
+
+    def test_provenance_and_evidence_survive_report_regeneration(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            audit.main(["prepare", "--xml-path", str(self.xml), "--output-dir", str(self.output),
+                        "--snapshot-date", "2026-05-29"])
+        self.run_direct(None, "--include-needs-review")
+        manifest = self.manifest()
+        report = self.output / "suspect_entries.csv"
+        with report.open() as stream:
+            rows = list(csv.DictReader(stream))
+        request = json.loads((self.output / "batch_requests.jsonl").read_text())
+        body = request["body"]
+        saved_prompt_hash = audit.sha256_json({
+            "system": body["input"][0]["content"][0]["text"],
+            "instructions": json.loads(body["input"][1]["content"][0]["text"])["instructions"],
+            "response_schema": body["text"]["format"]["schema"],
+        })
+        for row in rows:
+            self.assertEqual(row["dictionary_snapshot_date"], "2026-05-29")
+            self.assertEqual(row["dictionary_snapshot_date_source"], "user_supplied")
+            self.assertEqual(row["dictionary_xml_sha256"], audit.sha256_file(self.xml))
+            self.assertEqual(row["audit_model"], "gpt-6-luna")
+            self.assertEqual(row["audit_prompt_version"], "2")
+            self.assertEqual(row["audit_prompt_sha256"], saved_prompt_hash)
+            self.assertEqual(row["audit_prepared_at_utc"], manifest["created_at_utc"])
+            self.assertEqual(len(row["entry_sha256"]), 64)
+            self.assertTrue(json.loads(row["missing_meaning_evidence"])[0]["coverage_gap"])
+        original = report.read_bytes()
+        with patch.object(audit, "SYSTEM_PROMPT", "A future prompt"), patch.object(audit, "AUDIT_PROMPT_VERSION", "999"):
+            self.run_direct(None, "--resume", "--include-needs-review")
+            with patch.object(audit, "get_openai_client") as factory, contextlib.redirect_stdout(io.StringIO()):
+                audit.main(["summarize", "--output-dir", str(self.output), "--include-needs-review"])
+                factory.assert_not_called()
+        self.assertEqual(report.read_bytes(), original)
+
+    def test_legacy_prepared_run_and_checkpoint_use_their_original_schema(self):
+        manifest = self.manifest()
+        for key in ("audit_prompt_version", "audit_prompt_sha256", "dictionary_snapshot_date", "dictionary_snapshot_date_source"):
+            manifest.pop(key, None)
+        audit.save_manifest(self.output, manifest)
+        request_path = self.output / "batch_requests.jsonl"
+        requests = [json.loads(line) for line in request_path.read_text().splitlines()]
+        for request in requests:
+            schema = request["body"]["text"]["format"]["schema"]["properties"]["results"]["items"]
+            schema["required"].remove("missing_meaning_evidence")
+            schema["properties"].pop("missing_meaning_evidence")
+        request_path.write_text("\n".join(json.dumps(request) for request in requests) + "\n")
+
+        def legacy_response(body):
+            response = response_for(body)
+            content = response["output"][0]["content"][0]
+            payload = json.loads(content["text"])
+            for row in payload["results"]:
+                row.pop("missing_meaning_evidence")
+            content["text"] = json.dumps(payload)
+            return response
+
+        self.run_direct(FakeResponses(legacy_response))
+        _, _, factory = self.run_direct(None, "--resume")
+        factory.assert_not_called()
+        with (self.output / "suspect_entries.csv").open() as stream:
+            row = next(csv.DictReader(stream))
+        self.assertEqual(row["audit_prompt_version"], "unversioned")
+        self.assertEqual(row["audit_prompt_sha256"], "")
+        self.assertEqual(row["dictionary_snapshot_date"], "")
+        self.assertEqual(row["missing_meaning_evidence"], "[]")
+
+    def test_unsupported_missing_meaning_is_not_checkpointed(self):
+        for invalid_evidence in ([], [{"japanese_meaning": "a meaning"}], [{
+            "japanese_meaning": "meaning", "why_core": " ", "closest_existing_french": "sens", "coverage_gap": "gap",
+        }]):
+            with self.subTest(evidence=invalid_evidence):
+                def response_without_evidence(body):
+                    response = response_for(body)
+                    content = response["output"][0]["content"][0]
+                    payload = json.loads(content["text"])
+                    for row in payload["results"]:
+                        if row["status"] != "ok":
+                            row["missing_meaning_evidence"] = invalid_evidence
+                    content["text"] = json.dumps(payload)
+                    return response
+
+                extra = ("--resume",) if self.manifest().get("execution_mode") else ()
+                with self.assertRaises(SystemExit):
+                    self.run_direct(FakeResponses(response_without_evidence), *extra)
+                self.assertFalse((self.output / "direct_output.jsonl").exists())
+
+    def test_new_batch_results_require_evidence_but_legacy_results_still_load(self):
+        body = {"output": [{"content": [{"type": "output_text", "text": json.dumps({
+            "results": [{k: v for k, v in result_for(2).items() if k != "missing_meaning_evidence"}],
+        })}]}]}
+        raw = self.root / "batch.jsonl"
+        raw.write_text(json.dumps({"response": {"status_code": 200, "body": body}}) + "\n")
+        context = audit.load_context(self.output / "entry_context.jsonl")
+        with self.assertRaises(ValueError):
+            audit.parse_batch_output(raw, context, require_evidence=True)
+        rows, _ = audit.parse_batch_output(raw, context)
+        self.assertEqual(rows[0]["missing_meaning_evidence"], [])
+
+    def test_prepare_trusts_only_download_metadata_matching_the_xml(self):
+        metadata = {"xml_sha256": audit.sha256_file(self.xml), "headers": {"Last-Modified": "Fri, 29 May 2026 03:30:19 GMT"}}
+        metadata_path = self.root / "JMdict.download-metadata.json"
+        for matches in (True, False):
+            if not matches:
+                metadata["xml_sha256"] = "different-snapshot"
+            metadata_path.write_text(json.dumps(metadata))
+            with contextlib.redirect_stdout(io.StringIO()):
+                audit.main(["prepare", "--xml-path", str(self.xml), "--output-dir", str(self.output)])
+            self.assertEqual(self.manifest()["dictionary_snapshot_date"], "2026-05-29" if matches else "")
+
+
+class AuditInputTests(unittest.TestCase):
+    def setUp(self):
+        self.entry = audit.parse_entry(ET.fromstring(
+            '<entry><ent_seq>1</ent_seq><r_ele><reb>ことば</reb></r_ele>'
+            '<sense><gloss>word</gloss><gloss>language</gloss></sense>'
+            '<sense><gloss xml:lang="fre">mot</gloss><gloss xml:lang="fre">langue</gloss></sense></entry>'
+        ))
+
+    def test_request_distinguishes_complete_input_from_omitted_senses_or_glosses(self):
+        self.assertFalse(audit.compact_entry(self.entry, 40, 12)["input_truncated"])
+        self.assertTrue(audit.compact_entry(self.entry, 1, 12)["input_truncated"])
+        self.assertTrue(audit.compact_entry(self.entry, 40, 1)["input_truncated"])
+        self.assertEqual(len(self.entry.senses[1].french), 2)
+
+    def test_entry_hash_tracks_source_meaning_changes_not_report_formatting(self):
+        original = audit.asdict(self.entry)
+        formatted = copy.deepcopy(original)
+        formatted["current_french_senses"] = ["different display formatting"]
+        self.assertEqual(audit.entry_sha256(original), audit.entry_sha256(formatted))
+        formatted["senses"][1]["french"] = ["parole"]
+        self.assertNotEqual(audit.entry_sha256(original), audit.entry_sha256(formatted))
+
+    def test_optional_changes_cannot_be_returned_as_ok_with_issues(self):
+        row = result_for(1)
+        row["suggested_french_senses"] = ["an optional synonym"]
+        with self.assertRaises(ValueError):
+            audit.validate_audit_evidence(row)
+
+    def test_snapshot_date_is_not_inferred_from_preparation_or_download_time(self):
+        manifest = {"created_at_utc": "2026-10-28T00:00:00Z", "xml_sha256": "abc", "download_metadata": {
+            "xml_sha256": "abc", "downloaded_at_utc": "2026-05-29T12:00:00Z",
+        }}
+        self.assertEqual(audit.report_provenance(manifest)["dictionary_snapshot_date"], "")
+        self.assertEqual(audit.report_provenance(manifest)["audit_prompt_version"], "unversioned")
+        manifest["download_metadata"]["headers"] = {"last-modified": "not a date"}
+        self.assertEqual(audit.report_provenance(manifest)["dictionary_snapshot_date"], "")
 
 
 if __name__ == "__main__":

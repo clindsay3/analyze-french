@@ -25,31 +25,67 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Iterable
 
 
 XML_LANG = "{http://www.w3.org/XML/1998/namespace}lang"
 DEFAULT_JMDICT_URL = "http://ftp.edrdg.org/pub/Nihongo/JMdict.gz"
+AUDIT_PROMPT_VERSION = "2"
 
 SYSTEM_PROMPT = """You are a bilingual lexicography QA reviewer for Japanese-to-French dictionary entries.
 
-You receive JMdict entries with Japanese forms, English glosses as the trusted reference, and current French glosses to audit.
+You receive Japanese forms, English reference glosses, and current French glosses from JMdict.
+Judge the French against the Japanese meaning. English is supporting evidence, not an exhaustive checklist
+or an infallible authority. If the Japanese meaning or English reference is uncertain, do not invent a correction.
 
-Judge whether the French glosses are acceptable and whether they cover the core/common meaning(s).
+Evaluate semantic coverage across ALL French glosses in the entry together. Languages may group senses
+differently: one French gloss can cover several English senses or synonyms. Sense indices are source
+locations, not a required one-to-one alignment between languages. Before claiming an omission, consider
+the ordinary literal and figurative meanings of every existing French gloss in context.
+Ordinary polysemy counts without requiring parenthetical explanations. Do not report a concept as absent
+after acknowledging that an existing gloss naturally expresses it in the relevant context. A desire
+for a clearer explanatory label is not a semantic gap. If coverage is genuinely uncertain, use
+needs_review rather than likely_error and identify the unresolved substantive question.
 
-Flag only substantive problems:
-- missing central meaning
-- rare or secondary sense present while a common sense is missing
-- wrong or misleading French translation
-- unnatural French that would mislead users
-- obvious part-of-speech mismatch
+Respect concise dictionary conventions. A French noun can adequately translate a Japanese suru noun
+or na-adjective. Do not require separate noun, verb, adjective, adverb, or productive-prefix renderings
+of the same concept. Missing French POS annotations are not a defect. Flag part_of_speech_mismatch
+only when the rendering actually misrepresents the Japanese meaning, not because grammatical forms differ.
 
-Do not flag harmless wording differences, concise but accurate glosses, or cases where French is merely less detailed than English.
+Flag only substantive user-facing problems: wrong or misleading French, unnatural French that misleads,
+or a genuinely missing core/common Japanese meaning. A correct secondary gloss does not excuse an absent
+central meaning. Conversely, another English synonym, grammatical realization, illustrative context,
+rare/technical extension, or stylistic improvement does not by itself establish a missing core meaning.
+Useful optional expansion is not an error and does not warrant needs_review.
 
-Return exactly one result object per input entry. Keep summaries and suggestions concise.
+For each missing_core_meaning flag, supply missing_meaning_evidence identifying the Japanese concept,
+why it is core/common, the closest existing French gloss(es), and why those glosses do not already cover
+it. Merely saying an English gloss is not explicitly listed in French is insufficient. Do not assume
+the first sense is always the only central one. If input_truncated is true, unseen glosses may cover
+an apparent omission; do not assert a missing meaning on the basis of the incomplete input.
+
+Use ok when core meanings are adequately covered, even if expansion would be useful. Use needs_review
+only for a plausible substantive defect with unresolved evidence, and explain that uncertainty.
+Use likely_error only for a well-supported substantial defect. Confidence is confidence in this
+classification, not a calibrated probability. Do not automatically promote uncertain findings.
+
+Suggestions must address the demonstrated defect, preserve valid existing glosses, and be grounded in
+Japanese usage rather than mechanically translating every English gloss. For ok entries, return no
+issues or suggested changes, an empty missing_meaning_evidence array, and keep_existing.
+For other entries, missing_meaning_evidence must be nonempty exactly when missing_core_meaning is flagged.
+Return exactly one result per input entry. Keep explanations and suggestions concise.
 """
+
+AUDIT_INSTRUCTIONS = [
+    "Audit the French glosses collectively against Japanese meaning, using English as supporting evidence.",
+    "Return one result for every input entry.",
+    "Use likely_error only for substantial user-facing problems supported by evidence.",
+    "Use needs_review only for an uncertain substantive defect, not an optional addition.",
+    "Use ok for adequate concise coverage, including normal noun renderings of suru nouns and na-adjectives.",
+]
 
 RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -70,6 +106,7 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                     "core_meanings_french",
                     "suggested_french_senses",
                     "suggested_action",
+                    "missing_meaning_evidence",
                 ],
                 "properties": {
                     "ent_seq": {"type": "integer"},
@@ -97,6 +134,21 @@ RESPONSE_SCHEMA: dict[str, Any] = {
                         },
                     },
                     "problem_summary": {"type": "string"},
+                    "missing_meaning_evidence": {
+                        "type": "array",
+                        "description": "Evidence for each missing core meaning; empty if no missing_core_meaning issue.",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["japanese_meaning", "why_core", "closest_existing_french", "coverage_gap"],
+                            "properties": {
+                                "japanese_meaning": {"type": "string"},
+                                "why_core": {"type": "string"},
+                                "closest_existing_french": {"type": "string"},
+                                "coverage_gap": {"type": "string"},
+                            },
+                        },
+                    },
                     "core_meanings_french": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -170,6 +222,55 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def sha256_json(value: Any) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def entry_sha256(context: dict[str, Any]) -> str:
+    """Hash the complete parsed source entry, before request truncation or formatting."""
+    return sha256_json({key: context[key] for key in ("ent_seq", "kanji", "readings", "senses")})
+
+
+def parse_snapshot_date(value: str) -> str:
+    try:
+        parsed = date.fromisoformat(value)
+        if parsed.isoformat() != value:
+            raise ValueError("Use YYYY-MM-DD")
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Snapshot date must be YYYY-MM-DD.") from exc
+    return value
+
+
+def report_provenance(manifest: dict[str, Any]) -> dict[str, str]:
+    """Use saved run metadata only; never attribute today's prompt or date to old results."""
+    snapshot_date = manifest.get("dictionary_snapshot_date", "")
+    date_source = manifest.get("dictionary_snapshot_date_source", "")
+    metadata = manifest.get("download_metadata") or {}
+    if not snapshot_date and manifest.get("xml_sha256") and metadata.get("xml_sha256") == manifest["xml_sha256"]:
+        headers = {key.lower(): value for key, value in (metadata.get("headers") or {}).items()}
+        last_modified = headers.get("last-modified")
+        if last_modified:
+            try:
+                modified_at = parsedate_to_datetime(last_modified)
+                if modified_at.tzinfo is None:
+                    raise ValueError("Snapshot timestamps need an explicit timezone.")
+                snapshot_date = modified_at.astimezone(timezone.utc).date().isoformat()
+                date_source = "download_last_modified"
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return {
+        "audit_prepared_at_utc": manifest.get("created_at_utc", ""),
+        "dictionary_snapshot_date": snapshot_date,
+        "dictionary_snapshot_date_source": date_source,
+        "dictionary_xml_sha256": manifest.get("xml_sha256", ""),
+        "audit_model": manifest.get("model", ""),
+        "audit_reasoning_effort": manifest.get("reasoning_effort") or ("model_default" if manifest.get("model") else ""),
+        "audit_prompt_version": manifest.get("audit_prompt_version", "unversioned"),
+        "audit_prompt_sha256": manifest.get("audit_prompt_sha256", ""),
+    }
 
 
 def load_env(env_file: Path | None, api_key_file: Path | None) -> None:
@@ -343,18 +444,16 @@ def compact_entry(entry: EntryData, max_senses: int, max_glosses: int) -> dict[s
         "kanji": entry.kanji,
         "readings": entry.readings,
         "senses": senses,
+        "input_truncated": len(entry.senses) > max_senses or any(
+            len(sense.english) > max_glosses or len(sense.french) > max_glosses
+            for sense in entry.senses[:max_senses]
+        ),
     }
 
 
 def build_user_prompt(entries: list[EntryData], max_senses: int, max_glosses: int) -> str:
     payload = {
-        "instructions": [
-            "Audit the current French glosses against the Japanese forms and English glosses.",
-            "Return one result for every input entry.",
-            "Use likely_error only for substantial user-facing problems.",
-            "Use needs_review when there may be a problem but the evidence is ambiguous.",
-            "Use ok when the French glosses cover the core meanings well enough.",
-        ],
+        "instructions": AUDIT_INSTRUCTIONS,
         "entries": [compact_entry(e, max_senses=max_senses, max_glosses=max_glosses) for e in entries],
     }
     return json.dumps(payload, ensure_ascii=False)
@@ -484,6 +583,12 @@ def prepare_requests(args: argparse.Namespace, xml_path: Path, output_dir: Path)
         "xml_size_bytes": xml_path.stat().st_size,
         "xml_sha256": sha256_file(xml_path),
         "model": args.model,
+        "audit_prompt_version": AUDIT_PROMPT_VERSION,
+        "audit_prompt_sha256": sha256_json({
+            "system": SYSTEM_PROMPT, "instructions": AUDIT_INSTRUCTIONS, "response_schema": RESPONSE_SCHEMA,
+        }),
+        "dictionary_snapshot_date": args.snapshot_date or "",
+        "dictionary_snapshot_date_source": "user_supplied" if args.snapshot_date else "",
         "entries_per_request": args.entries_per_request,
         "max_senses_per_entry": args.max_senses_per_entry,
         "max_glosses_per_sense": args.max_glosses_per_sense,
@@ -496,7 +601,14 @@ def prepare_requests(args: argparse.Namespace, xml_path: Path, output_dir: Path)
     }
     metadata_candidate = xml_path.parent / "JMdict.download-metadata.json"
     if metadata_candidate.exists():
-        manifest["download_metadata"] = json.loads(metadata_candidate.read_text(encoding="utf-8"))
+        metadata = json.loads(metadata_candidate.read_text(encoding="utf-8"))
+        if metadata.get("xml_sha256") == manifest["xml_sha256"]:
+            manifest["download_metadata"] = metadata
+        else:
+            print("Warning: download metadata does not match this XML; its snapshot date will not be used.")
+    provenance = report_provenance(manifest)
+    manifest["dictionary_snapshot_date"] = provenance["dictionary_snapshot_date"]
+    manifest["dictionary_snapshot_date_source"] = provenance["dictionary_snapshot_date_source"]
     save_manifest(output_dir, manifest)
 
     print(f"Wrote {context_path}")
@@ -648,12 +760,19 @@ def normalize_result(row: dict[str, Any], context: dict[str, Any]) -> dict[str, 
         "core_meanings_french": row.get("core_meanings_french", []) or [],
         "suggested_french_senses": row.get("suggested_french_senses", []) or [],
         "suggested_action": row.get("suggested_action", "manual_review"),
+        "missing_meaning_evidence": row.get("missing_meaning_evidence", []) or [],
+        "entry_sha256": entry_sha256(context),
         "current_french_senses": context.get("current_french_senses", []),
         "current_english_senses": context.get("current_english_senses", []),
     }
 
 
-def parse_batch_output(raw_output_path: Path, context_by_seq: dict[int, dict[str, Any]]) -> tuple[list[dict[str, Any]], Counter]:
+def parse_batch_output(
+    raw_output_path: Path,
+    context_by_seq: dict[int, dict[str, Any]],
+    *,
+    require_evidence: bool = False,
+) -> tuple[list[dict[str, Any]], Counter]:
     rows: list[dict[str, Any]] = []
     usage = Counter()
     errors = 0
@@ -678,6 +797,8 @@ def parse_batch_output(raw_output_path: Path, context_by_seq: dict[int, dict[str
                 raise ValueError(f"No output text in batch output line {line_number}")
             payload = json.loads(output_text)
             for result in payload.get("results", []):
+                if require_evidence or "missing_meaning_evidence" in result:
+                    validate_audit_evidence(result)
                 seq = int(result["ent_seq"])
                 context = context_by_seq.get(seq)
                 if context is None:
@@ -711,7 +832,7 @@ def direct_request_sequences(request: dict[str, Any]) -> list[int]:
     return sequences
 
 
-def validate_direct_response(body: dict[str, Any], expected: list[int]) -> None:
+def validate_direct_response(body: dict[str, Any], expected: list[int], result_schema: dict[str, Any] | None = None) -> None:
     if body.get("status") != "completed" or body.get("error"):
         raise ValueError(f"Response did not complete: {body.get('status')}; {body.get('incomplete_details')}")
     text = extract_output_text(body)
@@ -720,7 +841,8 @@ def validate_direct_response(body: dict[str, Any], expected: list[int]) -> None:
     results = json.loads(text).get("results")
     if not isinstance(results, list):
         raise ValueError("Response has no results list.")
-    required = set(RESPONSE_SCHEMA["properties"]["results"]["items"]["required"])
+    schema = result_schema if result_schema is not None else RESPONSE_SCHEMA["properties"]["results"]["items"]
+    required = set(schema["required"])
     if any(not isinstance(row, dict) or not required.issubset(row) for row in results):
         raise ValueError("Response contains incomplete result objects.")
     sequences = [row["ent_seq"] for row in results]
@@ -728,6 +850,28 @@ def validate_direct_response(body: dict[str, Any], expected: list[int]) -> None:
         raise ValueError("Response sequence numbers must be integers.")
     if len(sequences) != len(expected) or set(sequences) != set(expected):
         raise ValueError("Response contains missing, duplicate, or unexpected entries.")
+    if "missing_meaning_evidence" in required:
+        for row in results:
+            validate_audit_evidence(row)
+
+
+def validate_audit_evidence(row: dict[str, Any]) -> None:
+    evidence = row.get("missing_meaning_evidence")
+    issues = row.get("issue_types")
+    if not isinstance(issues, list) or not isinstance(evidence, list):
+        raise ValueError("Audit issues and missing-meaning evidence must be lists.")
+    if bool(evidence) != ("missing_core_meaning" in issues):
+        raise ValueError("A missing-core-meaning issue requires evidence, and other issues must not carry it.")
+    for item in evidence:
+        if not isinstance(item, dict) or any(
+            not isinstance(item.get(key), str) or not item[key].strip()
+            for key in ("japanese_meaning", "why_core", "closest_existing_french", "coverage_gap")
+        ):
+            raise ValueError("Missing-meaning evidence must explain the concept, importance, existing French, and coverage gap.")
+    if row.get("status") == "ok" and (
+        issues or row.get("suggested_french_senses") or row.get("suggested_action") != "keep_existing"
+    ):
+        raise ValueError("An ok entry must not contain issues or suggested changes.")
 
 
 def run_direct(args: argparse.Namespace, output_dir: Path) -> int:
@@ -756,6 +900,7 @@ def run_direct(args: argparse.Namespace, output_dir: Path) -> int:
     requests = [json.loads(line) for line in requests_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     context = load_context(context_path)
     expected_by_request: dict[str, list[int]] = {}
+    schema_by_request: dict[str, dict[str, Any]] = {}
     for request in requests:
         custom_id = request.get("custom_id")
         if not isinstance(custom_id, str) or not custom_id or custom_id in expected_by_request:
@@ -763,6 +908,7 @@ def run_direct(args: argparse.Namespace, output_dir: Path) -> int:
         if request["body"].get("model") != manifest["model"]:
             raise ValueError("Prepared request model differs from the manifest.")
         expected_by_request[custom_id] = direct_request_sequences(request)
+        schema_by_request[custom_id] = request["body"]["text"]["format"]["schema"]["properties"]["results"]["items"]
     all_sequences = [seq for sequences in expected_by_request.values() for seq in sequences]
     if (len(requests) != manifest["request_count"] or not requests
             or len(all_sequences) != manifest["entry_count"]
@@ -782,7 +928,7 @@ def run_direct(args: argparse.Namespace, output_dir: Path) -> int:
             response = record["response"]
             if response.get("status_code") != 200:
                 raise ValueError("Direct checkpoint contains an unsuccessful request.")
-            validate_direct_response(response["body"], expected_by_request[custom_id])
+            validate_direct_response(response["body"], expected_by_request[custom_id], schema_by_request[custom_id])
             completed.add(custom_id)
     if len(completed) < manifest.get("direct_completed_requests", 0):
         raise ValueError("Saved direct responses are missing. Restore the checkpoint before resuming.")
@@ -797,7 +943,7 @@ def run_direct(args: argparse.Namespace, output_dir: Path) -> int:
 
     def save_reports(status: str) -> None:
         rows, usage = parse_batch_output(raw_path, context) if raw_path.exists() else ([], Counter())
-        write_artifacts(rows, output_dir, include_needs_review=args.include_needs_review, usage=usage)
+        write_artifacts(rows, output_dir, include_needs_review=args.include_needs_review, usage=usage, manifest=manifest)
         manifest.update(direct_status=status, direct_completed_requests=len(completed),
                         collected_result_count=len(rows), usage=dict(usage))
         if status == "completed":
@@ -816,7 +962,7 @@ def run_direct(args: argparse.Namespace, output_dir: Path) -> int:
                 raise RuntimeError("No API client is available for pending requests.")
             response = client.responses.create(**request["body"])
             body = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-            validate_direct_response(body, expected)
+            validate_direct_response(body, expected, schema_by_request[current_id])
             record = {"custom_id": current_id, "response": {"status_code": 200, "body": body}}
             with raw_path.open("a", encoding="utf-8") as checkpoint:
                 checkpoint.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -863,11 +1009,13 @@ def write_artifacts(
     *,
     include_needs_review: bool,
     usage: Counter | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> None:
     results_path = output_dir / "analysis_results.jsonl"
     csv_path = output_dir / "suspect_entries.csv"
     summary_path = output_dir / "summary.md"
     missing_core_path = output_dir / "likely_error_missing_core_meaning.txt"
+    provenance = report_provenance(manifest or {})
 
     with results_path.open("w", encoding="utf-8") as f:
         for row in rows:
@@ -885,6 +1033,9 @@ def write_artifacts(
         "suggested_action",
         "current_french_senses",
         "current_english_senses",
+        "missing_meaning_evidence",
+        "entry_sha256",
+        *provenance,
     ]
     with csv_path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=csv_fields)
@@ -905,6 +1056,9 @@ def write_artifacts(
                     "suggested_action": row.get("suggested_action", ""),
                     "current_french_senses": " | ".join(row.get("current_french_senses", [])),
                     "current_english_senses": " | ".join(row.get("current_english_senses", [])),
+                    "missing_meaning_evidence": json.dumps(row.get("missing_meaning_evidence", []), ensure_ascii=False),
+                    "entry_sha256": row.get("entry_sha256", ""),
+                    **provenance,
                 }
             )
 
@@ -932,6 +1086,14 @@ def write_artifacts(
         "",
         f"- Generated (UTC): {utc_now()}",
         f"- Entries processed: {len(rows)}",
+        f"- Audit prepared (UTC): {provenance['audit_prepared_at_utc'] or 'unknown'}",
+        f"- Dictionary snapshot date: {provenance['dictionary_snapshot_date'] or 'unknown'}",
+        f"- Snapshot date source: {provenance['dictionary_snapshot_date_source'] or 'unknown'}",
+        f"- Dictionary XML SHA-256: {provenance['dictionary_xml_sha256'] or 'unknown'}",
+        f"- Model: {provenance['audit_model'] or 'unknown'}",
+        f"- Reasoning effort: {provenance['audit_reasoning_effort'] or 'unknown'}",
+        f"- Audit prompt version: {provenance['audit_prompt_version']}",
+        f"- Audit prompt SHA-256: {provenance['audit_prompt_sha256'] or 'unknown'}",
         "",
         "## Status Counts",
     ]
@@ -1013,8 +1175,10 @@ def collect_batch(args: argparse.Namespace, output_dir: Path) -> int:
         print(f"Wrote {error_path}")
 
     context_by_seq = load_context(Path(manifest["context_path"]))
-    rows, usage = parse_batch_output(raw_output_path, context_by_seq)
-    write_artifacts(rows, output_dir, include_needs_review=args.include_needs_review, usage=usage)
+    rows, usage = parse_batch_output(
+        raw_output_path, context_by_seq, require_evidence=manifest.get("audit_prompt_version") == "2",
+    )
+    write_artifacts(rows, output_dir, include_needs_review=args.include_needs_review, usage=usage, manifest=manifest)
 
     manifest["collected_at_utc"] = utc_now()
     manifest["output_file_id"] = output_file_id
@@ -1039,11 +1203,12 @@ def summarize_results(args: argparse.Namespace, output_dir: Path) -> int:
         raise SystemExit(f"Results file not found: {results_path}")
     rows = [json.loads(line) for line in results_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     usage = Counter()
+    manifest: dict[str, Any] = {}
     manifest_path = output_dir / "manifest.json"
     if manifest_path.exists():
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         usage.update(manifest.get("usage") or {})
-    write_artifacts(rows, output_dir, include_needs_review=args.include_needs_review, usage=usage)
+    write_artifacts(rows, output_dir, include_needs_review=args.include_needs_review, usage=usage, manifest=manifest)
     return 0
 
 
@@ -1061,6 +1226,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     prep = sub.add_parser("prepare", help="Prepare API requests from JMdict XML")
     prep.add_argument("--xml-path", default="data/JMdict.xml")
+    prep.add_argument("--snapshot-date", type=parse_snapshot_date, help="Dictionary snapshot date (YYYY-MM-DD), if not available from matching download metadata")
     prep.add_argument("--output-dir", default="analysis_output_latest")
     prep.add_argument("--model", default="gpt-6-luna")
     prep.add_argument("--entries-per-request", type=int, default=20)

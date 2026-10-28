@@ -4,7 +4,17 @@ Audit French translations in [JMdict](https://www.edrdg.org/wiki/index.php/JMdic
 
 The Python script selects entries that already have French glosses and flags missing core meanings, misleading translations, unnatural French, and part-of-speech mismatches. It produces a CSV for review, detailed JSONL results, and a Markdown summary. It does not modify the dictionary.
 
-Results are model judgments, not verified dictionary corrections. Review flagged entries before changing or removing translations. English glosses are used as the reference, so errors or differences in their coverage can affect the findings. Entries without any French glosses are outside this audit's scope.
+Results are model judgments, not verified dictionary corrections. Review flagged entries before changing or removing translations. The Japanese meaning is the target, with English glosses as supporting evidence; errors or differences in the reference can still affect the findings. Entries without any French glosses are outside this audit's scope.
+
+## Audit criteria
+
+Prompt version 2 evaluates all French glosses in an entry together. French need not reproduce English sense divisions, synonym lists, or every grammatical form. Normal noun renderings of Japanese suru nouns and na-adjectives are acceptable, as are concise glosses covering several English meanings. Missing French POS annotations are not errors.
+
+Optional synonyms, technical extensions, and stylistic improvements do not warrant `needs_review`. That status is reserved for a plausible substantive defect with unresolved evidence. A genuinely absent central meaning remains a problem even if a secondary meaning is translated correctly.
+
+Every `missing_core_meaning` finding must include structured `missing_meaning_evidence`: the Japanese concept, why it is core/common, the closest existing French glosses, and why those glosses do not cover it. The runner checks that the evidence is present and nonempty, but a human must judge its linguistic accuracy. Suggestions should repair the demonstrated defect while preserving valid French. Entries classified `ok` have no issues or suggested changes.
+
+Prepared requests retain their original rubric and schema. To use version 2, prepare a new run directory. Resuming or summarizing an older run does not re-audit its entries with the new rubric.
 
 ## Requirements and setup
 
@@ -42,6 +52,8 @@ Run commands from the repository root. Keep each run's output directory intact: 
 ```
 
 This downloads the official multilingual `JMdict.gz`, decompresses it to `data/JMdict.xml`, and records download metadata and SHA-256 checksums. You can instead supply an existing multilingual JMdict XML file to `prepare`; an English-only file has no French entries to audit.
+
+Preparation records the dictionary snapshot date from the download's `Last-Modified` header only when the metadata's XML checksum matches the supplied XML. For an independently obtained snapshot with a known date, add `--snapshot-date YYYY-MM-DD` to `prepare`. Otherwise the snapshot date remains unknown; preparation time and download time are not substituted for it.
 
 ### 2. Prepare three entries locally
 
@@ -166,6 +178,10 @@ All files for a run live in its output directory:
 
 The three result statuses are `ok`, `needs_review`, and `likely_error`. A model's confidence score is not a calibrated probability. The sequence-number list is a candidate list; generating it does not remove dictionary content.
 
+Each CSV row also includes the missing-meaning evidence, an `entry_sha256`, and run provenance: preparation timestamp, dictionary snapshot date and its source, XML checksum, requested model and reasoning effort, and audit prompt version and checksum. The prompt checksum covers the system prompt, common user instructions, and response schema. These fields come from the saved run, so report regeneration does not attribute a newer rubric to older findings. Legacy runs show `unversioned` and leave unavailable provenance blank.
+
+The entry checksum covers the complete parsed entry (sequence number, Japanese forms/readings, and all parsed senses), before request truncation. It is not a checksum of raw XML or a claim that unparsed XML metadata is unchanged. Compare the saved entry context and current dictionary content before acting on an old finding; a new export date alone does not make that finding current. Older saved results may lack entry checksums or structured evidence.
+
 To include ambiguous entries in the CSV, pass `--include-needs-review` to `run` (or Batch `collect`), or regenerate the reports from saved results without another API call:
 
 ```bash
@@ -185,7 +201,7 @@ Use `--help` for the command list or a command's options:
 .venv/bin/python jmdict_french_audit.py collect --help
 ```
 
-`prepare` also accepts `--entries-per-request` (default 20), `--max-senses-per-entry` (40), `--max-glosses-per-sense` (12), `--max-output-tokens` (20000), and `--reasoning-effort`. Sense/gloss limits truncate the data sent to the model; keep them in mind when interpreting an audit. Supported reasoning settings depend on the selected model.
+`prepare` also accepts `--entries-per-request` (default 20), `--max-senses-per-entry` (40), `--max-glosses-per-sense` (12), `--max-output-tokens` (20000), and `--reasoning-effort`. Sense/gloss limits truncate the data sent to the model. Version 2 marks truncated inputs and instructs the model not to infer a missing meaning from unseen content; keep these limits in mind when interpreting an audit. Supported reasoning settings depend on the selected model.
 
 - **No French entries matched:** use the multilingual JMdict file and check any sequence-number filters.
 - **No API key or authentication failure:** check your environment or local `.env`, key permissions, billing, and model access.
